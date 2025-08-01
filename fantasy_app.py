@@ -721,7 +721,14 @@ def suggest_starting_lineup(roster: dict, league_info: dict, projections: pd.Dat
     return "\n".join(output_lines)
 
 
-def generate_newsletter(league_info: dict, rosters: List[dict], users: List[dict], ranking_df: pd.DataFrame, report_type: str) -> str:
+def generate_newsletter(
+    league_info: dict,
+    rosters: List[dict],
+    users: List[dict],
+    ranking_df: pd.DataFrame,
+    report_type: str,
+    spotlight_owner_id: Optional[str] = None,
+) -> str:
     """Create a newsletter string based on the selected report type.
 
     Args:
@@ -765,11 +772,17 @@ def generate_newsletter(league_info: dict, rosters: List[dict], users: List[dict
             lines.append(f"- {owner_name} ({row['total_proj']:.1f} pts)")
         lines.append("\nClose match‑ups and notable performances will be added once real scores are available.")
     else:  # Manager spotlight
-        # Pick the first user as spotlight if none specified
-        spotlight_user = users[0] if users else {}
-        owner_id = spotlight_user.get("user_id")
-        name = spotlight_user.get("display_name", "Anonymous")
-        team_name = spotlight_user.get("metadata", {}).get("team_name", "")
+        # Determine which manager to spotlight.  If a specific owner_id
+        # was provided, use it; otherwise default to the first user.
+        spotlight_user = None
+        owner_id = spotlight_owner_id
+        if owner_id:
+            spotlight_user = next((u for u in users if u.get("user_id") == owner_id), None)
+        if spotlight_user is None and users:
+            spotlight_user = users[0]
+            owner_id = spotlight_user.get("user_id")
+        name = spotlight_user.get("display_name", "Anonymous") if spotlight_user else "Anonymous"
+        team_name = spotlight_user.get("metadata", {}).get("team_name", "") if spotlight_user else ""
         lines.append(f"⭐ **Manager Spotlight: {name} ({team_name})**\n")
         # Basic season count: how many rosters does this user have across history?
         # This function only knows the current season; a more robust count
@@ -889,8 +902,21 @@ def main() -> None:
 
     st.subheader("Generate Newsletter")
     report_type = st.selectbox("Choose report type", ["Season recap", "Weekly recap", "Manager spotlight"])
+    # If manager spotlight, allow picking which manager
+    selected_spotlight_owner_id: Optional[str] = None
+    if report_type == "Manager spotlight":
+        manager_names = {u.get("display_name", u.get("user_id")): u.get("user_id") for u in users}
+        spotlight_name = st.selectbox("Choose a manager to spotlight", list(manager_names.keys()))
+        selected_spotlight_owner_id = manager_names.get(spotlight_name)
     if st.button("Generate report"):
-        report = generate_newsletter(league_info, rosters, users, ranking_df, report_type)
+        report = generate_newsletter(
+            league_info,
+            rosters,
+            users,
+            ranking_df,
+            report_type,
+            spotlight_owner_id=selected_spotlight_owner_id,
+        )
         st.text_area("Newsletter", report, height=300)
 
     # Matchup prediction section
