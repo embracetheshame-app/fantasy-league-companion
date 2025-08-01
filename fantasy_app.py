@@ -360,6 +360,28 @@ def predict_matchups(matchups: List[dict], rosters: List[dict], projections: pd.
             "key_players_a": key_a,
             "key_players_b": key_b,
         })
+    # Scale projections to more realistic fantasy football scores.  Compute
+    # the average projected points per team and scale towards a target
+    # average (e.g. 150 points) to avoid inflated totals from raw data.
+    if rows:
+        total_points = sum(r["proj_a"] + r["proj_b"] for r in rows)
+        team_count = 2 * len(rows)
+        avg_points = total_points / team_count if team_count else 0.0
+        target_avg = 150.0  # typical fantasy score per team
+        scale = target_avg / avg_points if avg_points > 0 else 1.0
+        for r in rows:
+            r["proj_a"] = round(r["proj_a"] * scale, 1)
+            r["proj_b"] = round(r["proj_b"] * scale, 1)
+            # Recompute margin and winner after scaling
+            if r["proj_a"] > r["proj_b"]:
+                r["predicted_winner"] = r["team_a"]
+                r["margin"] = r["proj_a"] - r["proj_b"]
+            elif r["proj_b"] > r["proj_a"]:
+                r["predicted_winner"] = r["team_b"]
+                r["margin"] = r["proj_b"] - r["proj_a"]
+            else:
+                r["predicted_winner"] = "Tie"
+                r["margin"] = 0.0
     return pd.DataFrame(rows)
 
 
