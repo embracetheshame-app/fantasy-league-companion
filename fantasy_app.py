@@ -193,19 +193,37 @@ def load_ffdp_projections() -> pd.DataFrame:
 
 def compute_power_rankings(rosters: List[dict], projections: pd.DataFrame) -> pd.DataFrame:
     """Compute simple power rankings by summing projected fantasy points
-    for each roster.  Returns a DataFrame with roster_id, manager,
-    total_projection and individual player list.
+    for each roster using real player names and projections.
+
+    This function loads the full Sleeper player mapping (cached) to
+    translate player IDs into names.  It then normalizes the names
+    (lowercased, stripped of punctuation) to match against the
+    projections table from Fantasy Football Data Pros.  Each team's
+    projected score is the sum of its players' projected points.
 
     Args:
         rosters (List[dict]): List of roster objects for a league.
-        projections (pd.DataFrame): Projection table with player_name and
-            projection columns.
+        projections (pd.DataFrame): Projection table with columns
+            [player_name, projection].
 
     Returns:
-        pd.DataFrame: Rankings sorted descending by total_projection.
+        pd.DataFrame: Rankings sorted descending by total_proj with
+            columns [owner_id, total_proj, players].
     """
-    # Build a quick lookup from lowercase player name to projection
-    proj_map = {name.lower(): row["projection"] for name, row in projections.set_index("player_name").iterrows()}
+    # Build a lookup from normalized player name to projection value
+    # (e.g. "christianmccaffrey" -> 22.5).  Normalize once to
+    # accelerate lookup in the loops below.
+    proj_map: Dict[str, float] = {}
+    for _, row in projections.iterrows():
+        name: str = row.get("player_name", "")
+        if not name:
+            continue
+        key = normalize_player_name(name)
+        # If multiple entries exist (duplicate names), keep the max
+        proj_map[key] = max(proj_map.get(key, 0.0), row.get("projection", 0.0))
+
+    # Load player metadata from Sleeper to map IDs to names and positions
+    players_meta = load_sleeper_players()
 
     rows = []
     for roster in rosters:
@@ -214,14 +232,13 @@ def compute_power_rankings(rosters: List[dict], projections: pd.DataFrame) -> pd
         total_proj = 0.0
         player_entries: List[str] = []
         for pid in players:
-            # In a fully fledged app, call `https://api.sleeper.app/v1/player/{pid}`
-            # to get the player's full name.  Here we skip network calls and
-            # treat the player ID string as the name key (not ideal).  If the
-            # projection for the player is missing, assign zero.
-            name_key = pid.lower()
-            proj = proj_map.get(name_key, 0.0)
+            pid_str = str(pid)
+            meta = players_meta.get(pid_str, {}) or {}
+            full_name = meta.get("full_name") or meta.get("name") or pid_str
+            key = normalize_player_name(full_name)
+            proj = proj_map.get(key, 0.0)
             total_proj += proj
-            player_entries.append(f"{pid} ({proj:.1f} pts)")
+            player_entries.append(f"{full_name} ({proj:.1f} pts)")
         rows.append({
             "owner_id": owner,
             "total_proj": total_proj,
@@ -256,10 +273,15 @@ def get_week_matchups(league_id: str, week: int) -> List[dict]:
 
 
 def predict_matchups(matchups: List[dict], rosters: List[dict], projections: pd.DataFrame) -> pd.DataFrame:
-    """Predict the outcome of each matchup based on ECR projections.
+    """Predict the outcome of each matchup using real player names and projections.
 
-    This function sums projected points for each team's starters and
-    determines the projected winner and margin.
+    This function sums projected points for each team's starters
+    (preferring the `starters` list on the matchup object; if not
+    present, it falls back to all players on the roster).  It also
+    records the top projected players for each team to aid in the
+    narrative preview.  Player IDs are translated to names via the
+    Sleeper players mapping and normalized to match against the
+    projection table.
 
     Args:
         matchups (List[dict]): List of matchup objects for a week.
@@ -269,16 +291,23 @@ def predict_matchups(matchups: List[dict], rosters: List[dict], projections: pd.
 
     Returns:
         pd.DataFrame: DataFrame with columns [matchup_id, team_a, team_b,
-            proj_a, proj_b, predicted_winner, margin].
+            proj_a, proj_b, predicted_winner, margin, key_players_a,
+            key_players_b].  The key_players_x columns are lists of the
+            top projected players (by name) for that team.
     """
-    # Build lookup from player id lower‑cased to projection value.  As we
-    # currently do not have player names keyed by Sleeper ID, we assume the
-    # projection table's index contains the Sleeper player id as name.  If the
-    # projection data does not match, projections will default to 0.
-    proj_map = {str(name).lower(): row["projection"] for name, row in projections.set_index("player_name").iterrows()}
-    # Build roster id -> owner id map
+    # Build normalized projection map: name -> projection
+    proj_map: Dict[str, float] = {}
+    for _, row in projections.iterrows():
+        pname: str = row.get("player_name", "")
+        if not pname:
+            continue
+        key = normalize_player_name(pname)
+        proj_map[key] = max(proj_map.get(key, 0.0), row.get("projection", 0.0))
+    # Load player metadata
+    players_meta = load_sleeper_players()
+    # Map roster_id to owner_id
     roster_owner = {r.get("roster_id"): r.get("owner_id") for r in rosters}
-    # Group matchups by the matchup_id field (teams in same matchup share id)
+    # Group matchups by matchup_id (each should have exactly two teams)
     by_id: Dict[str, List[dict]] = {}
     for m in matchups:
         m_id = m.get("matchup_id") or m.get("matchupId") or 0
@@ -286,17 +315,25 @@ def predict_matchups(matchups: List[dict], rosters: List[dict], projections: pd.
     rows = []
     for m_id, teams in by_id.items():
         if len(teams) != 2:
-            # Skip unmatched or odd entries
             continue
         team_a, team_b = teams
-        def total_proj(team: dict) -> float:
+        def compute_score_and_keys(team: dict) -> (float, List[str]):
             total = 0.0
-            starters = team.get("starters", []) or team.get("players", []) or []
+            starters = team.get("starters") or team.get("players") or []
+            key_players: List[tuple] = []  # (name, projection)
             for pid in starters:
-                total += proj_map.get(str(pid).lower(), 0.0)
-            return total
-        proj_a = total_proj(team_a)
-        proj_b = total_proj(team_b)
+                pid_str = str(pid)
+                meta = players_meta.get(pid_str, {}) or {}
+                full_name = meta.get("full_name") or meta.get("name") or pid_str
+                norm = normalize_player_name(full_name)
+                points = proj_map.get(norm, 0.0)
+                total += points
+                key_players.append((full_name, points))
+            # sort by projection descending and take top 3
+            top_names = [name for name, _ in sorted(key_players, key=lambda x: x[1], reverse=True)[:3]]
+            return total, top_names
+        proj_a, key_a = compute_score_and_keys(team_a)
+        proj_b, key_b = compute_score_and_keys(team_b)
         owner_a = roster_owner.get(team_a.get("roster_id"), str(team_a.get("roster_id")))
         owner_b = roster_owner.get(team_b.get("roster_id"), str(team_b.get("roster_id")))
         if proj_a > proj_b:
@@ -316,33 +353,60 @@ def predict_matchups(matchups: List[dict], rosters: List[dict], projections: pd.
             "proj_b": proj_b,
             "predicted_winner": winner,
             "margin": margin,
+            "key_players_a": key_a,
+            "key_players_b": key_b,
         })
     return pd.DataFrame(rows)
 
 
 def generate_matchup_preview(pred_df: pd.DataFrame, users: List[dict]) -> str:
-    """Generate a text preview of the week's matchups based on predictions.
+    """Generate a narrative preview of the week's matchups.
+
+    This function converts internal user IDs to display names and
+    constructs storylines for each matchup.  It highlights the
+    projected margin and key players on each team.  Ties are
+    presented as close battles.  If key player data is not
+    available, it falls back gracefully.
 
     Args:
         pred_df (pd.DataFrame): DataFrame returned by `predict_matchups`.
         users (List[dict]): League user objects for display names.
 
     Returns:
-        str: Formatted preview string.
+        str: Formatted preview string with bullet points.
     """
     user_map = {u.get("user_id"): u.get("display_name") for u in users}
     lines: List[str] = []
     for _, row in pred_df.iterrows():
         a_name = user_map.get(row["team_a"], row["team_a"])
         b_name = user_map.get(row["team_b"], row["team_b"])
+        key_a = row.get("key_players_a", [])
+        key_b = row.get("key_players_b", [])
         if row["predicted_winner"] == "Tie":
-            lines.append(f"- {a_name} vs {b_name} looks like a toss‑up with both teams around {row['proj_a']:.1f} points.")
+            # Toss‑up: both teams projected similarly
+            key_blurb = " and ".join([
+                f"{a_name} leans on {', '.join(key_a)}" if key_a else "",
+                f"{b_name} counters with {', '.join(key_b)}" if key_b else "",
+            ]).strip()
+            description = f"looks like a toss‑up around {row['proj_a']:.1f} points"
+            if key_blurb:
+                description += f" – {key_blurb}."
+            lines.append(f"- {a_name} vs {b_name} {description}")
         else:
             winner_name = user_map.get(row["predicted_winner"], row["predicted_winner"])
-            lines.append(
-                f"- {a_name} vs {b_name}: {winner_name} is favored by {row['margin']:.1f} points ("\
-                f"{row['proj_a']:.1f}–{row['proj_b']:.1f})."
-            )
+            loser_name = b_name if row["predicted_winner"] == row["team_a"] else a_name
+            winner_keys = key_a if row["predicted_winner"] == row["team_a"] else key_b
+            loser_keys = key_b if winner_keys is key_a else key_a
+            desc = f"is favored by {row['margin']:.1f} points "
+            desc += f"({row['proj_a']:.1f}–{row['proj_b']:.1f}). "
+            # Highlight star players
+            if winner_keys:
+                desc += f"{winner_name} will count on {', '.join(winner_keys)}"
+                if loser_keys:
+                    desc += f", while {loser_name} hopes {', '.join(loser_keys)} can keep it close."
+                else:
+                    desc += "."
+            lines.append(f"- {a_name} vs {b_name}: {winner_name} {desc}")
     return "\n".join(lines)
 
 
@@ -401,7 +465,260 @@ def handle_query(query: str, league_info: dict, rosters: List[dict], users: List
             f"Scoring settings – Pass TD: {scoring.get('pass_td')}, Rush TD: {scoring.get('rush_td')}, "
             f"Reception: {scoring.get('rec')}, Pass Yard: {scoring.get('pass_yd')}, Rush Yard: {scoring.get('rush_yd')}."
         )
+    if "lineup" in q or "start" in q:
+        # Suggest lineup for a manager
+        for name, uid in name_map.items():
+            if name and name in q:
+                roster = next((r for r in rosters if r.get("owner_id") == uid), None)
+                if roster:
+                    lineup = suggest_starting_lineup(roster, league_info, load_ffdp_projections())
+                    return f"Lineup advice for {user_map.get(uid, uid)}:\n{lineup}"
+                return f"Couldn't find roster for {user_map.get(uid, uid)}."
+        return "Please specify which manager you'd like a lineup suggestion for."
+    if "trade" in q:
+        # Suggest trade partner for a manager
+        pos_totals = compute_positional_totals(rosters, load_ffdp_projections())
+        for name, uid in name_map.items():
+            if name and name in q:
+                suggestion = suggest_trade_partner(uid, pos_totals, users)
+                return suggestion or "No suitable trade partner found."
+        return "Please specify which manager you're asking about for a trade suggestion."
+    if "strength" in q or "weakness" in q:
+        # Provide strengths/weaknesses for a manager
+        pos_totals = compute_positional_totals(rosters, load_ffdp_projections())
+        for name, uid in name_map.items():
+            if name and name in q:
+                mgr_row = pos_totals[pos_totals["owner_id"] == uid]
+                if mgr_row.empty:
+                    return f"No data found for {user_map.get(uid, uid)}."
+                mgr_row = mgr_row.iloc[0]
+                league_avg = pos_totals[["QB", "RB", "WR", "TE"]].mean()
+                strengths = [pos for pos in ["QB", "RB", "WR", "TE"] if mgr_row[pos] > league_avg[pos]]
+                weaknesses = [pos for pos in ["QB", "RB", "WR", "TE"] if mgr_row[pos] < league_avg[pos]]
+                return f"{user_map.get(uid, uid)}'s strengths: {', '.join(strengths) if strengths else 'None'}; weaknesses: {', '.join(weaknesses) if weaknesses else 'None'}."
+        return "Specify which manager you want strength/weakness information for."
     return "I'm sorry, I didn't understand that question. Try asking about a roster, ranking or league settings."
+
+
+# -----------------------------------------------------------------------------
+# Sleeper player mapping and normalization helpers
+
+@lru_cache(maxsize=1)
+def load_sleeper_players() -> Dict[str, dict]:
+    """Load the full Sleeper players dictionary.
+
+    Returns:
+        Dict[str, dict]: Mapping of player_id to player metadata.
+    """
+    url = "https://api.sleeper.app/v1/players/nfl"
+    try:
+        return fetch_json(url)
+    except Exception:
+        return {}
+
+
+def normalize_player_name(name: str) -> str:
+    """Normalize a player's name for matching.
+
+    Lowercases, removes spaces and punctuation.
+    """
+    import re
+    return re.sub(r"[^a-z0-9]", "", name.lower()) if name else ""
+
+
+# -----------------------------------------------------------------------------
+# Analysis helpers for manager strengths, trade suggestions and lineup advice
+
+def compute_positional_totals(rosters: List[dict], projections: pd.DataFrame) -> pd.DataFrame:
+    """Compute the total projected points by position for each roster.
+
+    This helper returns a DataFrame where each row corresponds to a
+    roster and columns include `owner_id`, `QB`, `RB`, `WR`, `TE` and
+    `Other`.  Totals are computed using projections from the provided
+    projections table and the Sleeper player metadata.
+
+    Args:
+        rosters (List[dict]): Roster objects for a league.
+        projections (pd.DataFrame): Projection data with columns
+            [player_name, projection].
+
+    Returns:
+        pd.DataFrame: DataFrame with positional totals.
+    """
+    # Build normalized projection map
+    proj_map: Dict[str, float] = {}
+    for _, row in projections.iterrows():
+        pname = row.get("player_name", "")
+        if not pname:
+            continue
+        key = normalize_player_name(pname)
+        proj_map[key] = max(proj_map.get(key, 0.0), row.get("projection", 0.0))
+    players_meta = load_sleeper_players()
+    result_rows: List[dict] = []
+    for roster in rosters:
+        owner = roster.get("owner_id")
+        pos_totals = {"QB": 0.0, "RB": 0.0, "WR": 0.0, "TE": 0.0, "Other": 0.0}
+        for pid in roster.get("players", []) or []:
+            pid_str = str(pid)
+            meta = players_meta.get(pid_str, {}) or {}
+            pos = meta.get("position") or "Other"
+            full_name = meta.get("full_name") or meta.get("name") or pid_str
+            key = normalize_player_name(full_name)
+            pts = proj_map.get(key, 0.0)
+            if pos not in pos_totals:
+                pos = "Other"
+            pos_totals[pos] += pts
+        pos_totals["owner_id"] = owner
+        result_rows.append(pos_totals)
+    df = pd.DataFrame(result_rows)
+    # Ensure missing columns appear
+    for col in ["QB", "RB", "WR", "TE", "Other"]:
+        if col not in df.columns:
+            df[col] = 0.0
+    return df[["owner_id", "QB", "RB", "WR", "TE", "Other"]]
+
+
+def suggest_trade_partner(owner_id: str, pos_totals: pd.DataFrame, users: List[dict]) -> Optional[str]:
+    """Suggest a potential trade partner for the given manager.
+
+    The heuristic identifies the manager's weakest position and finds
+    another team that is strong at that position but weak where the
+    manager is strong.  If no complementary partner exists, returns
+    None.
+
+    Args:
+        owner_id (str): User ID of the manager.
+        pos_totals (pd.DataFrame): Position totals by owner_id.
+        users (List[dict]): User objects for display names.
+
+    Returns:
+        Optional[str]: A human‑readable suggestion like
+            "Consider trading with {partner_name}: you need RB help and they need WRs".
+    """
+    # Compute league averages for each position (excluding owner column)
+    stat_cols = ["QB", "RB", "WR", "TE"]
+    league_avg = pos_totals[stat_cols].mean()
+    # Get manager row
+    mgr_row = pos_totals[pos_totals["owner_id"] == owner_id]
+    if mgr_row.empty:
+        return None
+    mgr_row = mgr_row.iloc[0]
+    # Differences from league average
+    diffs = {col: mgr_row[col] - league_avg[col] for col in stat_cols}
+    # Identify strongest and weakest positions for manager
+    strength_pos = max(diffs, key=diffs.get)
+    weakness_pos = min(diffs, key=diffs.get)
+    # Build user map for names
+    name_map = {u.get("user_id"): u.get("display_name") for u in users}
+    best_partner = None
+    best_score = -float("inf")
+    for _, row in pos_totals.iterrows():
+        other_id = row["owner_id"]
+        if other_id == owner_id:
+            continue
+        # this team should be strong at manager's weakness and weak at manager's strength
+        diff_weak = row[weakness_pos] - league_avg[weakness_pos]
+        diff_strength = row[strength_pos] - league_avg[strength_pos]
+        # require they have a positive surplus in weakness_pos and a negative in strength_pos
+        score = diff_weak - diff_strength
+        if diff_weak > 0 and diff_strength < 0 and score > best_score:
+            best_score = score
+            best_partner = other_id
+    if best_partner is None:
+        return None
+    partner_name = name_map.get(best_partner, str(best_partner))
+    return f"Consider trading with {partner_name}: you need help at {weakness_pos}, and they could use {strength_pos}."
+
+
+def suggest_starting_lineup(roster: dict, league_info: dict, projections: pd.DataFrame) -> str:
+    """Suggest an optimal starting lineup for a given roster based on projections.
+
+    This function examines the league's roster positions to determine
+    how many starters are required at each position (QB, RB, WR, TE,
+    FLEX and SUPER_FLEX).  It then selects the highest projected
+    players available on the team to fill those slots.  Remaining
+    players are considered bench.  Returns a formatted string with
+    recommendations.
+
+    Args:
+        roster (dict): Roster object for one team.
+        league_info (dict): League settings including roster_positions.
+        projections (pd.DataFrame): Projection data with player_name and projection.
+
+    Returns:
+        str: A human‑readable lineup suggestion.
+    """
+    # Build normalized projection map
+    proj_map: Dict[str, float] = {}
+    for _, row in projections.iterrows():
+        pname = row.get("player_name", "")
+        if not pname:
+            continue
+        key = normalize_player_name(pname)
+        proj_map[key] = max(proj_map.get(key, 0.0), row.get("projection", 0.0))
+    players_meta = load_sleeper_players()
+    # Determine starting slot counts
+    roster_positions = league_info.get("roster_positions", []) or []
+    # Count starting requirements excluding bench and other non‑start slots
+    from collections import Counter
+    pos_counts = Counter()
+    for pos in roster_positions:
+        upper = pos.upper()
+        # Skip bench and special slots
+        if upper in {"BN", "IR", "TAXI", "PRACTICE", "RES"}:
+            continue
+        pos_counts[upper] += 1
+    # Extract all players with metadata and projections
+    player_list: List[tuple] = []  # (name, pos, projection)
+    for pid in roster.get("players", []) or []:
+        pid_str = str(pid)
+        meta = players_meta.get(pid_str, {}) or {}
+        full_name = meta.get("full_name") or meta.get("name") or pid_str
+        pos = (meta.get("position") or "Other").upper()
+        norm = normalize_player_name(full_name)
+        proj = proj_map.get(norm, 0.0)
+        player_list.append((full_name, pos, proj))
+    # Build lineup
+    used = set()
+    starters: List[str] = []
+    # Helper to select players for a given position
+    def select_players(position: str, count: int, eligible_positions: List[str]):
+        selected = []
+        for _ in range(count):
+            # Among unused players with eligible positions, pick highest projection
+            candidates = [(i, p) for i, p in enumerate(player_list) if i not in used and p[1] in eligible_positions]
+            if not candidates:
+                continue
+            idx, player = max(candidates, key=lambda x: x[1][2])
+            used.add(idx)
+            selected.append(player)
+        return selected
+    # Standard positions
+    starters += [f"{name} ({proj:.1f} pts)" for name, _, proj in select_players("QB", pos_counts.get("QB", 0), ["QB"])]
+    starters += [f"{name} ({proj:.1f} pts)" for name, _, proj in select_players("RB", pos_counts.get("RB", 0), ["RB"])]
+    starters += [f"{name} ({proj:.1f} pts)" for name, _, proj in select_players("WR", pos_counts.get("WR", 0), ["WR"])]
+    starters += [f"{name} ({proj:.1f} pts)" for name, _, proj in select_players("TE", pos_counts.get("TE", 0), ["TE"])]
+    # Flex positions (RB/WR/TE)
+    starters += [f"{name} ({proj:.1f} pts)" for name, _, proj in select_players("FLEX", pos_counts.get("FLEX", 0), ["RB", "WR", "TE"])]
+    # Super flex positions (QB/RB/WR/TE)
+    starters += [f"{name} ({proj:.1f} pts)" for name, _, proj in select_players("SUPER_FLEX", pos_counts.get("SUPER_FLEX", 0), ["QB", "RB", "WR", "TE"])]
+    # Bench are remaining players
+    bench = [f"{name} ({proj:.1f} pts)" for i, (name, _, proj) in enumerate(player_list) if i not in used]
+    # Format recommendation
+    output_lines = []
+    output_lines.append("**Recommended starters:**")
+    if starters:
+        for s in starters:
+            output_lines.append(f"- {s}")
+    else:
+        output_lines.append("(No eligible starters found)")
+    output_lines.append("\n**Bench options:**")
+    if bench:
+        for b in bench:
+            output_lines.append(f"- {b}")
+    else:
+        output_lines.append("(No remaining players)")
+    return "\n".join(output_lines)
 
 
 def generate_newsletter(league_info: dict, rosters: List[dict], users: List[dict], ranking_df: pd.DataFrame, report_type: str) -> str:
@@ -430,8 +747,16 @@ def generate_newsletter(league_info: dict, rosters: List[dict], users: List[dict
         lines.append("- TBD: Use real match‑ups and weekly scores once the season is underway.")
         lines.append("- Most improved manager: TBD")
         lines.append("\nFun facts:")
-        lines.append("- The league uses half‑PPR scoring, so receptions count for 0.5 points.")
-        lines.append("- Super‑flex allows teams to start two QBs, making passers highly coveted.")
+        # Describe scoring settings succinctly
+        scoring = league_info.get("scoring_settings", {})
+        rec_pts = scoring.get("rec")
+        rec_desc = "half‑PPR" if rec_pts == 0.5 else ("PPR" if rec_pts == 1 else "standard")
+        lines.append(f"- This is a {rec_desc} league (receptions worth {rec_pts or 0} points).")
+        # Describe roster structure
+        positions = league_info.get("roster_positions", []) or []
+        starter_counts = {pos: positions.count(pos) for pos in set(positions) if pos not in {"BN", "IR", "TAXI", "PRACTICE", "RES"}}
+        pos_desc = ", ".join([f"{cnt}×{pos}" for pos, cnt in starter_counts.items()]) if starter_counts else "unknown"
+        lines.append(f"- Starting lineup: {pos_desc}. Bench and taxi spots not shown.")
     elif report_type == "Weekly recap":
         lines.append(f"📅 **{league_name} – Week {league_info.get('leg', '?')} Recap**\n")
         lines.append("Top projected teams of the week:")
@@ -440,14 +765,53 @@ def generate_newsletter(league_info: dict, rosters: List[dict], users: List[dict
             lines.append(f"- {owner_name} ({row['total_proj']:.1f} pts)")
         lines.append("\nClose match‑ups and notable performances will be added once real scores are available.")
     else:  # Manager spotlight
+        # Pick the first user as spotlight if none specified
         spotlight_user = users[0] if users else {}
+        owner_id = spotlight_user.get("user_id")
         name = spotlight_user.get("display_name", "Anonymous")
         team_name = spotlight_user.get("metadata", {}).get("team_name", "")
         lines.append(f"⭐ **Manager Spotlight: {name} ({team_name})**\n")
+        # Basic season count: how many rosters does this user have across history?
+        # This function only knows the current season; a more robust count
+        # would use `build_manager_profiles` and historical leagues.  Here we
+        # approximate seasons as 1.
         lines.append("Seasons played: 1 (historical data not yet computed)")
-        lines.append("Preferred positions: TBD (requires historical roster analysis)")
-        lines.append("Notable trades: TBD\n")
-        lines.append("Why they’re dangerous: TBD")
+        # Compute positional totals to infer strengths/weaknesses
+        pos_totals = compute_positional_totals(rosters, load_ffdp_projections())
+        # Suggest trade partner
+        suggestion = suggest_trade_partner(owner_id, pos_totals, users)
+        lines.append("\nPositional analysis:")
+        if not pos_totals.empty:
+            mgr_row = pos_totals[pos_totals["owner_id"] == owner_id]
+            if not mgr_row.empty:
+                mgr_row = mgr_row.iloc[0]
+                # Compute league averages
+                league_avg = pos_totals[["QB", "RB", "WR", "TE"]].mean()
+                # Strengths and weaknesses
+                strengths = []
+                weaknesses = []
+                for pos in ["QB", "RB", "WR", "TE"]:
+                    diff = mgr_row[pos] - league_avg[pos]
+                    if diff > 0:
+                        strengths.append(pos)
+                    elif diff < 0:
+                        weaknesses.append(pos)
+                lines.append(f"- Strengths: {', '.join(strengths) if strengths else 'None' }")
+                lines.append(f"- Weaknesses: {', '.join(weaknesses) if weaknesses else 'None' }")
+            else:
+                lines.append("- No roster data available.")
+        else:
+            lines.append("- Could not compute positional totals.")
+        if suggestion:
+            lines.append(f"\nTrade idea: {suggestion}")
+        # Starting lineup recommendation
+        # Find roster of this manager
+        spotlight_roster = next((r for r in rosters if r.get("owner_id") == owner_id), None)
+        if spotlight_roster:
+            lineup = suggest_starting_lineup(spotlight_roster, league_info, load_ffdp_projections())
+            lines.append("\nLineup advice:\n" + lineup)
+        else:
+            lines.append("\nLineup advice: roster not found.")
     return "\n".join(lines)
 
 
@@ -564,6 +928,40 @@ def main() -> None:
         st.session_state.messages.append({"role": "assistant", "content": answer})
         # Display response immediately
         st.chat_message("assistant").markdown(answer)
+
+    # Manager analysis section
+    st.subheader("Manager Analysis")
+    # Build mapping of display names to owner_ids
+    manager_options = {u.get("display_name", u.get("user_id")): u.get("user_id") for u in users}
+    selected_manager_name = st.selectbox("Select a manager to analyze", list(manager_options.keys()))
+    selected_owner_id = manager_options.get(selected_manager_name)
+    if st.button("Analyze manager"):
+        with st.spinner("Computing strengths, trade suggestions and lineup recommendations…"):
+            pos_totals = compute_positional_totals(rosters, projections)
+            suggestion = suggest_trade_partner(selected_owner_id, pos_totals, users)
+            spotlight_roster = next((r for r in rosters if r.get("owner_id") == selected_owner_id), None)
+            strengths = []
+            weaknesses = []
+            # Strengths and weaknesses relative to league averages
+            if not pos_totals.empty:
+                mgr_row = pos_totals[pos_totals["owner_id"] == selected_owner_id]
+                if not mgr_row.empty:
+                    mgr_row = mgr_row.iloc[0]
+                    league_avg = pos_totals[["QB", "RB", "WR", "TE"]].mean()
+                    for pos in ["QB", "RB", "WR", "TE"]:
+                        diff = mgr_row[pos] - league_avg[pos]
+                        if diff > 0:
+                            strengths.append(pos)
+                        elif diff < 0:
+                            weaknesses.append(pos)
+            lineup_advice = "No roster found." if not spotlight_roster else suggest_starting_lineup(spotlight_roster, league_info, projections)
+        # Display analysis
+        st.markdown(f"**Strengths:** {', '.join(strengths) if strengths else 'None'}")
+        st.markdown(f"**Weaknesses:** {', '.join(weaknesses) if weaknesses else 'None'}")
+        if suggestion:
+            st.markdown(f"**Trade suggestion:** {suggestion}")
+        st.markdown("**Lineup recommendation:**")
+        st.markdown(lineup_advice)
 
 
 if __name__ == "__main__":
