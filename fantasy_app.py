@@ -233,6 +233,177 @@ def compute_power_rankings(rosters: List[dict], projections: pd.DataFrame) -> pd
     return df
 
 
+# -----------------------------------------------------------------------------
+# New helper functions for matchup predictions and chat
+
+def get_week_matchups(league_id: str, week: int) -> List[dict]:
+    """Fetch matchup objects for a given league and week.
+
+    Each matchup entry contains a roster_id and a list of starters/players.
+
+    Args:
+        league_id (str): League identifier.
+        week (int): Week number (1–18 for regular season).
+
+    Returns:
+        List[dict]: Matchup objects with roster_id and starters.
+    """
+    url = f"https://api.sleeper.app/v1/league/{league_id}/matchups/{week}"
+    try:
+        return fetch_json(url)
+    except Exception:
+        return []
+
+
+def predict_matchups(matchups: List[dict], rosters: List[dict], projections: pd.DataFrame) -> pd.DataFrame:
+    """Predict the outcome of each matchup based on ECR projections.
+
+    This function sums projected points for each team's starters and
+    determines the projected winner and margin.
+
+    Args:
+        matchups (List[dict]): List of matchup objects for a week.
+        rosters (List[dict]): List of roster objects for the league (owner ids).
+        projections (pd.DataFrame): Player projection data with columns
+            [player_name, projection].
+
+    Returns:
+        pd.DataFrame: DataFrame with columns [matchup_id, team_a, team_b,
+            proj_a, proj_b, predicted_winner, margin].
+    """
+    # Build lookup from player id lower‑cased to projection value.  As we
+    # currently do not have player names keyed by Sleeper ID, we assume the
+    # projection table's index contains the Sleeper player id as name.  If the
+    # projection data does not match, projections will default to 0.
+    proj_map = {str(name).lower(): row["projection"] for name, row in projections.set_index("player_name").iterrows()}
+    # Build roster id -> owner id map
+    roster_owner = {r.get("roster_id"): r.get("owner_id") for r in rosters}
+    # Group matchups by the matchup_id field (teams in same matchup share id)
+    by_id: Dict[str, List[dict]] = {}
+    for m in matchups:
+        m_id = m.get("matchup_id") or m.get("matchupId") or 0
+        by_id.setdefault(str(m_id), []).append(m)
+    rows = []
+    for m_id, teams in by_id.items():
+        if len(teams) != 2:
+            # Skip unmatched or odd entries
+            continue
+        team_a, team_b = teams
+        def total_proj(team: dict) -> float:
+            total = 0.0
+            starters = team.get("starters", []) or team.get("players", []) or []
+            for pid in starters:
+                total += proj_map.get(str(pid).lower(), 0.0)
+            return total
+        proj_a = total_proj(team_a)
+        proj_b = total_proj(team_b)
+        owner_a = roster_owner.get(team_a.get("roster_id"), str(team_a.get("roster_id")))
+        owner_b = roster_owner.get(team_b.get("roster_id"), str(team_b.get("roster_id")))
+        if proj_a > proj_b:
+            winner = owner_a
+            margin = proj_a - proj_b
+        elif proj_b > proj_a:
+            winner = owner_b
+            margin = proj_b - proj_a
+        else:
+            winner = "Tie"
+            margin = 0.0
+        rows.append({
+            "matchup_id": m_id,
+            "team_a": owner_a,
+            "team_b": owner_b,
+            "proj_a": proj_a,
+            "proj_b": proj_b,
+            "predicted_winner": winner,
+            "margin": margin,
+        })
+    return pd.DataFrame(rows)
+
+
+def generate_matchup_preview(pred_df: pd.DataFrame, users: List[dict]) -> str:
+    """Generate a text preview of the week's matchups based on predictions.
+
+    Args:
+        pred_df (pd.DataFrame): DataFrame returned by `predict_matchups`.
+        users (List[dict]): League user objects for display names.
+
+    Returns:
+        str: Formatted preview string.
+    """
+    user_map = {u.get("user_id"): u.get("display_name") for u in users}
+    lines: List[str] = []
+    for _, row in pred_df.iterrows():
+        a_name = user_map.get(row["team_a"], row["team_a"])
+        b_name = user_map.get(row["team_b"], row["team_b"])
+        if row["predicted_winner"] == "Tie":
+            lines.append(f"- {a_name} vs {b_name} looks like a toss‑up with both teams around {row['proj_a']:.1f} points.")
+        else:
+            winner_name = user_map.get(row["predicted_winner"], row["predicted_winner"])
+            lines.append(
+                f"- {a_name} vs {b_name}: {winner_name} is favored by {row['margin']:.1f} points ("\
+                f"{row['proj_a']:.1f}–{row['proj_b']:.1f})."
+            )
+    return "\n".join(lines)
+
+
+def handle_query(query: str, league_info: dict, rosters: List[dict], users: List[dict], ranking_df: pd.DataFrame) -> str:
+    """Simple query handler for the chat interface.
+
+    This function parses basic questions about rosters, rankings and settings
+    and returns a short answer.  It is intentionally simple; for more
+    sophisticated natural‑language handling consider integrating a language
+    model.
+
+    Args:
+        query (str): User question.
+        league_info (dict): League metadata.
+        rosters (List[dict]): Rosters for the league.
+        users (List[dict]): Users in the league.
+        ranking_df (pd.DataFrame): Power rankings table.
+
+    Returns:
+        str: Chat response.
+    """
+    q = query.lower()
+    # Map user_id to display name
+    user_map = {u.get("user_id"): u.get("display_name") for u in users}
+    # Reverse mapping name -> user_id (case insensitive)
+    name_map = {u.get("display_name", "").lower(): u.get("user_id") for u in users}
+    if "roster" in q:
+        # Expect query like "show roster for EmbraceTheShame"
+        for name, uid in name_map.items():
+            if name and name in q:
+                # Find roster
+                for r in rosters:
+                    if r.get("owner_id") == uid:
+                        players = r.get("players", []) or []
+                        return f"Roster for {user_map.get(uid, uid)}: {', '.join(players) if players else 'No players listed.'}"
+        return "Sorry, I couldn't identify which manager's roster you're asking about."
+    if "rank" in q or "power" in q:
+        # Provide ranking of a manager or general top rankings
+        for name, uid in name_map.items():
+            if name and name in q:
+                # Find ranking position
+                row = ranking_df[ranking_df["owner_id"] == uid]
+                if not row.empty:
+                    pos = row.index[0]
+                    score = row.iloc[0]["total_proj"]
+                    return f"{user_map.get(uid, uid)} is ranked #{pos} with {score:.1f} projected points."
+                return f"{user_map.get(uid, uid)} is not ranked."
+        # Return overall top 3
+        lines = []
+        for idx, row in ranking_df.head(3).iterrows():
+            lines.append(f"{idx}. {user_map.get(row['owner_id'], row['owner_id'])}: {row['total_proj']:.1f} pts")
+        return "Top projected teams:\n" + "\n".join(lines)
+    if "setting" in q or "scoring" in q:
+        scoring = league_info.get("scoring_settings", {})
+        return (
+            f"Scoring settings – Pass TD: {scoring.get('pass_td')}, Rush TD: {scoring.get('rush_td')}, "
+            f"Reception: {scoring.get('rec')}, Pass Yard: {scoring.get('pass_yd')}, Rush Yard: {scoring.get('rush_yd')}."
+        )
+    return "I'm sorry, I didn't understand that question. Try asking about a roster, ranking or league settings."
+
+
 def generate_newsletter(league_info: dict, rosters: List[dict], users: List[dict], ranking_df: pd.DataFrame, report_type: str) -> str:
     """Create a newsletter string based on the selected report type.
 
@@ -357,6 +528,42 @@ def main() -> None:
     if st.button("Generate report"):
         report = generate_newsletter(league_info, rosters, users, ranking_df, report_type)
         st.text_area("Newsletter", report, height=300)
+
+    # Matchup prediction section
+    st.subheader("Matchup Predictions")
+    week = st.number_input("Select week", min_value=1, max_value=18, value=1, step=1)
+    if st.button("Predict matchups"):
+        with st.spinner("Fetching matchups and projecting scores…"):
+            matchups = get_week_matchups(league_id, int(week))
+            if matchups:
+                pred_df = predict_matchups(matchups, rosters, projections)
+            else:
+                pred_df = pd.DataFrame(columns=["matchup_id", "team_a", "team_b", "proj_a", "proj_b", "predicted_winner", "margin"])
+        if pred_df.empty:
+            st.info("No matchups data available for that week.")
+        else:
+            st.dataframe(pred_df)
+            preview = generate_matchup_preview(pred_df, users)
+            st.markdown("**Matchup previews:**\n" + preview)
+
+    # Chat interface section
+    st.subheader("Query Chat")
+    # Initialize message history
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+    # Display previous messages
+    for msg in st.session_state.messages:
+        st.chat_message(msg["role"]).markdown(msg["content"])
+    # Chat input
+    user_query = st.chat_input("Ask a question about rosters, rankings or settings")
+    if user_query:
+        # Append user message
+        st.session_state.messages.append({"role": "user", "content": user_query})
+        # Generate response
+        answer = handle_query(user_query, league_info, rosters, users, ranking_df)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        # Display response immediately
+        st.chat_message("assistant").markdown(answer)
 
 
 if __name__ == "__main__":
