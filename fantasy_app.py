@@ -1075,8 +1075,35 @@ def main() -> None:
 
     st.subheader("Generate Newsletter")
     report_type = st.selectbox("Choose report type", ["Season recap", "Weekly recap", "Manager spotlight"])
-    # If manager spotlight, allow picking which manager
+    # Variables to hold context for newsletter generation
     selected_spotlight_owner_id: Optional[str] = None
+    selected_league_for_recap: dict = league_info
+    selected_rosters_for_recap: List[dict] = rosters
+    selected_users_for_recap: List[dict] = users
+    selected_ranking_for_recap: pd.DataFrame = ranking_df
+    # When season recap is selected, allow choosing a specific year
+    if report_type == "Season recap":
+        # Fetch historical leagues once for season selection
+        historical = get_historical_leagues(league_id)
+        # Build map of season year -> league object
+        season_map = {l.get("season"): l for l in historical if l.get("season")}
+        # Sort seasons descending (most recent first)
+        season_years = sorted(season_map.keys(), reverse=True)
+        season_choice = st.selectbox("Select season year", season_years)
+        # Update selected league data if different from current
+        selected_league_for_recap = season_map.get(season_choice, league_info)
+        # If not the same as current, fetch rosters/users for that season
+        if selected_league_for_recap.get("league_id") != league_info.get("league_id"):
+            rec_league_id = selected_league_for_recap.get("league_id")
+            selected_rosters_for_recap = get_league_rosters(rec_league_id)
+            selected_users_for_recap = get_league_users(rec_league_id)
+            selected_ranking_for_recap = compute_power_rankings(selected_rosters_for_recap, projections)
+        else:
+            # Same season, reuse existing data
+            selected_rosters_for_recap = rosters
+            selected_users_for_recap = users
+            selected_ranking_for_recap = ranking_df
+    # If manager spotlight, allow picking which manager
     if report_type == "Manager spotlight":
         manager_names = {u.get("display_name", u.get("user_id")): u.get("user_id") for u in users}
         spotlight_name = st.selectbox("Choose a manager to spotlight", list(manager_names.keys()))
@@ -1087,22 +1114,22 @@ def main() -> None:
     if llm_available:
         use_llm_newsletter = st.checkbox("Use ChatGPT for newsletter", value=False)
     if st.button("Generate report"):
-        # Choose generator based on LLM availability and user preference
+        # Determine generator based on LLM availability and user preference
         if llm_available and use_llm_newsletter:
             report = generate_newsletter_llm(
-                league_info,
-                rosters,
-                users,
-                ranking_df,
+                selected_league_for_recap,
+                selected_rosters_for_recap,
+                selected_users_for_recap,
+                selected_ranking_for_recap,
                 report_type,
                 spotlight_owner_id=selected_spotlight_owner_id,
             )
         else:
             report = generate_newsletter(
-                league_info,
-                rosters,
-                users,
-                ranking_df,
+                selected_league_for_recap,
+                selected_rosters_for_recap,
+                selected_users_for_recap,
+                selected_ranking_for_recap,
                 report_type,
                 spotlight_owner_id=selected_spotlight_owner_id,
             )
